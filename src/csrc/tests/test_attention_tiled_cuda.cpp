@@ -34,12 +34,12 @@ torch::Tensor attention_reference_cuda(
         -std::numeric_limits<float>::infinity());
   }
 
-  return torch::matmul(torch::softmax(scores, -1), value.to(torch::kFloat32)).to(torch::kFloat16);
+  return torch::matmul(torch::softmax(scores, -1), value.to(torch::kFloat32)).to(torch::kBFloat16);
 }
 
 torch::Tensor make_cuda_tensor(int batch_size = 8, int num_heads = 8, int seq_len = 128, int head_dim = 64) {
   return torch::randn({batch_size, num_heads, seq_len, head_dim},
-                      torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
+                      torch::TensorOptions().device(torch::kCUDA).dtype(torch::kBFloat16));
 }
 
 }  // namespace
@@ -64,12 +64,12 @@ FLASH_ATTENTION_TEST(cuda_matches_reference_non_causal) {
       attention_reference_cuda(query, key, value, false, c10::nullopt);
 
   FLASH_ATTENTION_ASSERT(actual.is_cuda());
-  FLASH_ATTENTION_ASSERT(actual.scalar_type() == torch::kFloat16);
+  FLASH_ATTENTION_ASSERT(actual.scalar_type() == torch::kBFloat16);
   FLASH_ATTENTION_ASSERT_TENSOR_CLOSE(
       actual.cpu().to(torch::kFloat32),
       expected.cpu().to(torch::kFloat32),
-      2e-3,
-      1e-3);
+      2e-2,
+      1e-2);
 }
 
 // FLASH_ATTENTION_TEST(cuda_matches_reference_causal_with_custom_scale) {

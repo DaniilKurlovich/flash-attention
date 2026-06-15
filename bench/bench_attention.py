@@ -33,7 +33,9 @@ def _fmt_us(t_s: float) -> str:
     return f"{t_s * 1e3:>7.2f} ms"
 
 
-def _attention_flops(batch: int, heads: int, q_len: int, k_len: int, dim: int, value_dim: int) -> float:
+def _attention_flops(
+    batch: int, heads: int, q_len: int, k_len: int, dim: int, value_dim: int
+) -> float:
     """Return FLOPs for a single attention forward pass."""
     # Q @ K^T
     flops_qk = 2.0 * batch * heads * q_len * k_len * dim
@@ -91,7 +93,12 @@ def _bench_one(
     times.sort()
     median_s = times[len(times) // 2]
     flops = _attention_flops(
-        query.shape[0], query.shape[1], query.shape[2], key.shape[2], query.shape[3], value.shape[3]
+        query.shape[0],
+        query.shape[1],
+        query.shape[2],
+        key.shape[2],
+        query.shape[3],
+        value.shape[3],
     )
     tflops = (flops / median_s) / 1e12
     return {
@@ -124,17 +131,25 @@ def benchmark(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if dtype is None:
-        dtype = torch.float16 if device.type == "cuda" else torch.float32
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     print(f"{'=' * 70}")
     print(f"Config: B={batch}, H={heads}, Q={q_len}, K={k_len}, D={dim}, V={value_dim}")
-    print(f"        causal={causal}, tile_size={tile_size}, device={device}, dtype={dtype}")
+    print(
+        f"        causal={causal}, tile_size={tile_size}, device={device}, dtype={dtype}"
+    )
     print(f"{'=' * 70}")
 
     generator = torch.Generator().manual_seed(42)
-    query = torch.randn(batch, heads, q_len, dim, dtype=dtype, generator=generator).to(device)
-    key = torch.randn(batch, heads, k_len, dim, dtype=dtype, generator=generator).to(device)
-    value = torch.randn(batch, heads, k_len, value_dim, dtype=dtype, generator=generator).to(device)
+    query = torch.randn(batch, heads, q_len, dim, dtype=dtype, generator=generator).to(
+        device
+    )
+    key = torch.randn(batch, heads, k_len, dim, dtype=dtype, generator=generator).to(
+        device
+    )
+    value = torch.randn(
+        batch, heads, k_len, value_dim, dtype=dtype, generator=generator
+    ).to(device)
 
     results = []
 
@@ -142,7 +157,9 @@ def benchmark(
     results.append(
         _bench_one(
             attention_reference,
-            query, key, value,
+            query,
+            key,
+            value,
             causal=causal,
             name="pytorch_reference",
             warmup=warmup,
@@ -154,7 +171,9 @@ def benchmark(
     results.append(
         _bench_one(
             attention_tiled_online_softmax_reference,
-            query, key, value,
+            query,
+            key,
+            value,
             causal=causal,
             tile_size=tile_size,
             name="tiled_python",
@@ -168,7 +187,9 @@ def benchmark(
         results.append(
             _bench_one(
                 attention_tiled_online_softmax_cpp,
-                query, key, value,
+                query,
+                key,
+                value,
                 causal=causal,
                 tile_size=tile_size,
                 name="cpp_extension",
@@ -181,14 +202,18 @@ def benchmark(
 
     # 4. torch.nn.functional.scaled_dot_product_attention (if available)
     try:
+
         def _sdpa(q, k, v, *, causal=False):
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, is_causal=causal
             )
+
         results.append(
             _bench_one(
                 _sdpa,
-                query, key, value,
+                query,
+                key,
+                value,
                 causal=causal,
                 name="torch_sdpa",
                 warmup=warmup,
@@ -232,8 +257,12 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--dtype", type=str, default=None, choices=("fp16", "fp32", "bf16"))
-    parser.add_argument("--sweep", action="store_true", help="Sweep over sequence lengths")
+    parser.add_argument(
+        "--dtype", type=str, default=None, choices=("fp16", "fp32", "bf16")
+    )
+    parser.add_argument(
+        "--sweep", action="store_true", help="Sweep over sequence lengths"
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else None

@@ -53,7 +53,7 @@ cmake --build build-cuda
 PYTHONPATH=build-cuda/python python -m pytest tests
 ```
 
-The CUDA kernel currently requires `head_dim == 128` and `dtype == float16`.
+The CUDA kernel currently requires `head_dim == 64` and `dtype == bfloat16`.
 
 To build and run the native C++ test binary:
 
