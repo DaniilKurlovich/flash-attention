@@ -58,6 +58,7 @@ set(FLASH_ATTENTION_TEST_SOURCES
 
 if(FLASH_ATTENTION_ENABLE_CUDA)
   list(APPEND FLASH_ATTENTION_TEST_SOURCES src/csrc/tests/test_attention_tiled_cuda.cpp)
+  #list(APPEND FLASH_ATTENTION_TEST_SOURCES src/csrc/tests/test_attention_tiled_cuda_debug.cpp)
 endif()
 
 function(configure_flash_attention_native_target target_name)

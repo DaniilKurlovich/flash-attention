@@ -1,0 +1,34 @@
+{                                                                                                                                                                                                         
+	"languages": {                                                                                                                                                                                          
+		"Python": {                                                                                                                                                                                           
+			"language_servers": ["pyright", "ruff"],                                                                                                                                                            
+			"format_on_save": true                                                                                                                                                                              
+		},                                                                                                                                                                                                    
+		"C++": {                                                                                                                                                                                              
+			"language_servers": ["clangd"]                                                                                                                                                                      
+		},                                                                                                                                                                                                    
+		"CUDA C++": {                                                                                                                                                                                         
+			"language_servers": ["clangd"]                                                                                                                                                                      
+		}                                                                                                                                                                                                     
+	},                                                                                                                                                                                                      
+	"lsp": {                                                                                                                                                                                                
+		"pyright": {                                                                                                                                                                                          
+			"settings": {                                                                                                                                                                                       
+				"python": {                                                                                                                                                                                       
+					"pythonPath": "/root/flash-attention/.venv/bin/python"                                                                                                                                          
+				},                                                                                                                                                                                                
+				"venvPath": "/root/flash-attention",                                                                                                                                                              
+				"venv": ".venv"                                                                                                                                                                                   
+			}                                                                                                                                                                                                   
+		},                                                                                                                                                                                                    
+		"clangd": {                                                                                                                                                                                           
+			"binary": {                                                                                                                                                                                         
+				"path": "/usr/bin/clangd",                                                                                                                                                                        
+				"arguments": [                                                                                                                                                                                    
+					"--compile-commands-dir=build-cuda",                                                                                                                                                            
+					"--cuda-path=/usr/local/cuda"                                                                                                                                                                   
+				]                                                                                                                                                                                                 
+			}                                                                                                                                                                                                   
+		}                                                                                                                                                                                                     
+	}                                                                                                                                                                                                       
+} 

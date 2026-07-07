@@ -13,7 +13,7 @@
 
 namespace {
 
-constexpr int BLOCK_DIM = 256;
+constexpr int BLOCK_DIM = 128;
 
 template <int ROW_SIZE, int COL_SIZE, int BLOCK_SIZE>
 __device__ inline void global_to_shared_copy_by_tile_in_bf16(const nv_bfloat16* src, uint32_t dst,
@@ -42,7 +42,7 @@ __device__ inline void global_to_shared_copy_by_tile_in_bf16(const nv_bfloat16* 
 
 __device__ inline void ldmatrix_x4(uint32_t dst[4], uint32_t src) {
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
         : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
         : "r"(src)
     );
@@ -50,7 +50,7 @@ __device__ inline void ldmatrix_x4(uint32_t dst[4], uint32_t src) {
 
 __device__ inline void ldmatrix_x2(uint32_t dst[2], uint32_t src) {
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
         : "=r"(dst[0]), "=r"(dst[1])
         : "r"(src)
     );
@@ -58,7 +58,7 @@ __device__ inline void ldmatrix_x2(uint32_t dst[2], uint32_t src) {
 
 __device__ inline void ldmatrix_x2_transpose(uint32_t dst[2], uint32_t src) {
     asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
         : "=r"(dst[0]), "=r"(dst[1])
         : "r"(src)
     );
@@ -107,7 +107,6 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
   int o_stride_h,
   int o_stride_n,
 
-  float scale,
   bool causal
 ) {
   // using namespace nvcuda;
@@ -123,10 +122,6 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
   __shared__ __nv_bfloat16 q_smem[BLOCK_M][HEAD_DIM];
   __shared__ __nv_bfloat16 k_smem[BLOCK_N][HEAD_DIM];
   __shared__ __nv_bfloat16 v_smem[BLOCK_N][HEAD_DIM];
-  __shared__ __nv_bfloat16 p_smem[BLOCK_M][BLOCK_N];
-
-  __shared__ float s_smem[BLOCK_M][BLOCK_N];
-  __shared__ float o_smem[BLOCK_M][HEAD_DIM];
 
   int batch_id = blockIdx.z;
   int head_id = blockIdx.y;
@@ -181,7 +176,8 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
           // lanes 16-31: row offset 0..15, col offset 8 (NOTE: this split its need for ldmatrix 8x8.x4 convention)
           const int row = mma_row_id * WMMA_N + (lane_id % 16);
           const int col = mma_col_id * WMMA_K + (lane_id / 16) * 8;
-          uint32_t q_addr_smem_src = q_addr_smem + (row * BLOCK_M + col) * sizeof(half);
+          if (global_start_row + row >= q_seq_len) continue;
+          uint32_t q_addr_smem_src = q_addr_smem + (row * HEAD_DIM + col) * sizeof(__nv_bfloat16);
           ldmatrix_x4(Q_rmem[mma_row_id][mma_col_id], q_addr_smem_src);
       }
   }
@@ -202,7 +198,7 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
             // lanes 0-7: col offset 0;
             // lanes 8-16: col offset 8
             const int col = mma_col_id * WMMA_K + (lane_id / 8) * 8;
-            uint32_t k_addr_smem_src = k_addr_smem + (row * BLOCK_N + col) * sizeof(half);
+            uint32_t k_addr_smem_src = k_addr_smem + (row * HEAD_DIM + col) * sizeof(__nv_bfloat16);
             ldmatrix_x2(K_rmem[mma_row_id][mma_col_id], k_addr_smem_src);
         }
     }
@@ -221,11 +217,12 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
         }
     }
 
+    const float kScale = rsqrtf(HEAD_DIM);
     // apply scale and compute online softmax
     for (int mma_row_id = 0; mma_row_id < BLOCK_M / WMMA_M; ++mma_row_id) {
         for (int mma_col_id = 0; mma_col_id < BLOCK_N / WMMA_N; ++mma_col_id) {
             for (int d = 0; d < 4; ++d) {
-                S_rmem[mma_row_id][mma_col_id][d] *= scale;
+                S_rmem[mma_row_id][mma_col_id][d] *= kScale;
             }
         }
 
@@ -267,14 +264,23 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
             reqs[2] = __expf(S_rmem[mma_row_id][mma_col_id][2] - max_prev[mma_row_id][1]);
             reqs[3] = __expf(S_rmem[mma_row_id][mma_col_id][3] - max_prev[mma_row_id][1]);
 
-            cur_rowsumexp[0] = reqs[0] + reqs[1];
-            cur_rowsumexp[1] = reqs[2] + reqs[2];
+            cur_rowsumexp[0] += reqs[0] + reqs[1];
+            cur_rowsumexp[1] += reqs[2] + reqs[3];
 
             P_rmem[mma_row_id][mma_col_id][0] = __float2bfloat16(reqs[0]);
             P_rmem[mma_row_id][mma_col_id][1] = __float2bfloat16(reqs[1]);
             P_rmem[mma_row_id][mma_col_id][2] = __float2bfloat16(reqs[2]);
             P_rmem[mma_row_id][mma_col_id][3] = __float2bfloat16(reqs[3]);
         }
+
+        // butterfly reduction
+        cur_rowsumexp[0] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[0], 1);
+        cur_rowsumexp[0] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[0], 2);
+        cur_rowsumexp[1] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[1], 1);
+        cur_rowsumexp[1] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[1], 2);
+
+        row_sumexp[mma_row_id][0] = row_sumexp[mma_row_id][0] * scale[0] + cur_rowsumexp[0];
+        row_sumexp[mma_row_id][1] = row_sumexp[mma_row_id][1] * scale[1] + cur_rowsumexp[1];
     }
 
     // Load V tile into shared memory.
@@ -282,24 +288,29 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
     // load V on registers
     for (int mma_row_id = 0; mma_row_id < BLOCK_N / WMMA_N; ++mma_row_id) {
         for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-            // m16n8k16 support only row, col format need transpose
-            int row = mma_row_id * WMMA_N + (lane_id / 8);
-            int col = mma_col_id * WMMA_K + (lane_id / 8) * 8;
+            // m16n8k16 expects B in col-major; V is row-major in smem, so we
+            // use ldmatrix_x2_transpose. The source addressing is the same as
+            // a non-transposed m8n8 x2 load: each warp half reads one 8-column
+            // block of an 8-row stripe.
+            const int row = mma_row_id * WMMA_N + (lane_id % 8);
+            const int col = mma_col_id * WMMA_K + (lane_id / 8) * 8;
 
-            int v_addr_smem_src = v_addr_smem + (row * HEAD_DIM + col) * sizeof(__nv_bfloat16);
+            uint32_t v_addr_smem_src = v_addr_smem + (row * HEAD_DIM + col) * sizeof(__nv_bfloat16);
             ldmatrix_x2_transpose(V_rmem[mma_row_id][mma_col_id], v_addr_smem_src);
         }
     }
 
     // ---- Tensor Core GEMM: O += P @ V ----
     // A = P : BLOCK_M x BLOCK_N, row-major
-    // B = V : BLOCK_N x HEAD_DIM, row-major
+    // B = V : BLOCK_N x HEAD_DIM, row-major (loaded transposed for col-major B)
     // C = O : BLOCK_M x HEAD_DIM, row-major
     for (int mma_row_id = 0; mma_row_id < BLOCK_M / WMMA_M; ++mma_row_id) {
         for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-            mma_m16n8k16(P_rmem[mma_row_id][mma_col_id],
-                         V_rmem[mma_row_id][mma_col_id],
-                         O_rmem[mma_row_id][mma_col_id]);
+            for (int k_id = 0; k_id < BLOCK_N / WMMA_N; ++k_id) {
+                mma_m16n8k16(P_rmem[mma_row_id][k_id],
+                             V_rmem[k_id][mma_col_id],
+                             O_rmem[mma_row_id][mma_col_id]);
+            }
         }
     }
   }
@@ -343,7 +354,6 @@ void launch_attention_v3(
     int num_heads,
     int q_seq_len,
     int kv_seq_len,
-    float softmax_scale,
     bool causal,
     dim3 grid,
     dim3 block) {
@@ -373,7 +383,6 @@ void launch_attention_v3(
       static_cast<int>(output_tensor.stride(0)),
       static_cast<int>(output_tensor.stride(1)),
       static_cast<int>(output_tensor.stride(2)),
-      softmax_scale,
       causal
   );
 }
@@ -409,9 +418,9 @@ torch::Tensor attention_tiled_online_softmax_cuda(
   const int value_dim = static_cast<int>(value.size(3));
   const int k_seq_len = static_cast<int>(key.size(2));
   // :TODO add assert for head_dim
-  const float softmax_scale = scale.has_value()
-      ? static_cast<float>(*scale)
-      : 1.0f / std::sqrt(static_cast<float>(query.size(3)));
+  // const float softmax_scale = scale.has_value()
+  //     ? static_cast<float>(*scale)
+  //     : 1.0f / std::sqrt(static_cast<float>(query.size(3)));
 
   auto output_tensor = torch::zeros(
     {batch_size, num_heads, q_seq_len, value_dim},
@@ -434,7 +443,7 @@ torch::Tensor attention_tiled_online_softmax_cuda(
   // TORCH_CHECK(m_tensor.is_contiguous());
   // TORCH_CHECK(m_tensor.dtype() == torch::kFloat32);
 
-  constexpr int kBlockM = 32;
+  constexpr int kBlockM = 64;
   constexpr int kBlockN = 64;
   constexpr int kHeadDim = 64;
   TORCH_CHECK(query.size(3) == kHeadDim, "expected head_dim == 64");
@@ -452,11 +461,10 @@ torch::Tensor attention_tiled_online_softmax_cuda(
       num_heads,
       q_seq_len,
       k_seq_len,
-      softmax_scale,
       causal,
       grid,
       block);
-  // C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return output_tensor;
 }

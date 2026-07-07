@@ -2,7 +2,7 @@ cuda-bindings==13.2.0
 cuda-pathfinder==1.5.3
 cuda-toolkit==13.0.2
 filelock==3.29.0
--e file:///home/daniil/code/flash-attention
+#-e file:///home/daniil/code/flash-attention
 fsspec==2026.3.0
 iniconfig==2.3.0
 jinja2==3.1.6
