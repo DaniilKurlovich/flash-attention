@@ -2,7 +2,7 @@
 
 ## Scope
 
-This repository starts with a day-1 correctness baseline for Flash Attention in pure PyTorch and adds a fused CUDA kernel path on top of it. The goal is to keep a readable reference implementation while experimenting with a high-performance kernel.
+This repository implement combine version of Flash Attention papers (v1, v2)
 
 Implemented today:
 
@@ -86,31 +86,6 @@ PYTHONPATH=build-cuda/python:$PYTHONPATH python3 bench/bench_attention.py --swee
 
 ```bash
 ./bench/profile_cuda.sh
-```
-
-Extra arguments are forwarded to `ncu` (e.g. `./bench/profile_cuda.sh --device 0`).
-
-Open the report for inspection in `ncu-ui`:
-
-```bash
-ncu-ui ncu_report.ncu-rep
-```
-
-### Source-level hotspot analysis
-
-The CUDA build embeds `-lineinfo`, so the Nsight Compute **Source** page maps SASS instructions back to `src/csrc/attention_tiled_cuda.cu`. Use it to identify hotspots in:
-
-- QK^T compute (around line 115)
-- causal / bounds mask logic (around line 127)
-- online softmax update (around line 134)
-- PV accumulation (around line 177)
-
-### Permission fix for `ncu`
-
-If you get `ERR_NVGPUCTRPERM`:
-
-```bash
-sudo chmod 666 /dev/nvidia-caps/nvidia-cap1 /dev/nvidia-caps/nvidia-cap2
 ```
 
 ## Project Layout
