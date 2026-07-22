@@ -1,12 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(flash_attention LANGUAGES CXX)
+project(flash_attention LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(FLASH_ATTENTION_ENABLE_CUDA "Enable future CUDA targets" OFF)
+# Optional CUDA register cap. 0 means no limit; otherwise passed as
+# -maxrregcount=N to nvcc for all CUDA sources.
+set(FLASH_ATTENTION_CUDA_MAXREGCOUNT "0" CACHE STRING
+    "CUDA -maxrregcount value (0 disables the cap)")
 
 # Development.Module component was added in CMake 3.18.
 # For older versions fall back to the Development component.
@@ -39,27 +42,18 @@ execute_process(
 
 set(FLASH_ATTENTION_SOURCES
   src/csrc/attention_tiled.cpp
+  src/csrc/attention_tiled_cuda.cu
 )
-
-if(FLASH_ATTENTION_ENABLE_CUDA)
-  enable_language(CUDA)
-  list(APPEND FLASH_ATTENTION_SOURCES src/csrc/attention_tiled_cuda.cu)
-endif()
 
 set(FLASH_ATTENTION_PYTHON_SOURCES
   src/csrc/python_module.cpp
 )
 
 set(FLASH_ATTENTION_TEST_SOURCES
-  src/csrc/tests/test_attention_tiled.cpp
+  src/csrc/tests/test_attention_tiled_cuda.cpp
   src/csrc/tests/test_harness.cpp
   src/csrc/tests/test_main.cpp
 )
-
-if(FLASH_ATTENTION_ENABLE_CUDA)
-  list(APPEND FLASH_ATTENTION_TEST_SOURCES src/csrc/tests/test_attention_tiled_cuda.cpp)
-  #list(APPEND FLASH_ATTENTION_TEST_SOURCES src/csrc/tests/test_attention_tiled_cuda_debug.cpp)
-endif()
 
 function(configure_flash_attention_native_target target_name)
   target_link_libraries(${target_name} PRIVATE ${TORCH_LIBRARIES})
@@ -72,7 +66,7 @@ function(configure_flash_attention_native_target target_name)
   )
   target_compile_definitions(
     ${target_name}
-    PRIVATE FLASH_ATTENTION_ENABLE_CUDA=$<BOOL:${FLASH_ATTENTION_ENABLE_CUDA}>
+    PRIVATE FLASH_ATTENTION_ENABLE_CUDA=1
   )
 
   if(TORCH_CXX_FLAGS)
@@ -80,20 +74,31 @@ function(configure_flash_attention_native_target target_name)
     target_compile_options(${target_name} PRIVATE ${TORCH_CXX_FLAGS_LIST})
   endif()
 
-  if(FLASH_ATTENTION_ENABLE_CUDA)
-    set_target_properties(
-      ${target_name}
-      PROPERTIES
-        CUDA_STANDARD 17
-        CUDA_STANDARD_REQUIRED ON
-    )
+  set_target_properties(
+    ${target_name}
+    PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+  )
+  # Optional per-thread register cap for CUDA kernels. Set to 0 (default) to
+  # let the compiler choose; use e.g. 128 or 160 to trade register pressure for
+  # occupancy. A value that is too low will cause spills.
+  if(FLASH_ATTENTION_CUDA_MAXREGCOUNT GREATER 0)
     target_compile_options(
       ${target_name}
       PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-G>
-        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+        $<$<COMPILE_LANGUAGE:CUDA>:-maxrregcount=${FLASH_ATTENTION_CUDA_MAXREGCOUNT}>
     )
   endif()
+
+  target_compile_options(
+    ${target_name}
+    PRIVATE
+      $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-G>
+      $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+      # Verbose ptxas output: register usage, stack frame, spill stores/loads.
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
+  )
 endfunction()
 
 add_library(
@@ -128,11 +133,17 @@ add_executable(
 )
 configure_flash_attention_native_target(flash_attention_csrc_tests)
 
+add_executable(
+  tmp_matrix_product
+  src/csrc/tmp_matrix_product_qk_t.cu
+)
+configure_flash_attention_native_target(tmp_matrix_product)
+
 # The test binary links against torch internals that may pull in a newer
 # cudart than the system CUDA toolkit provides.
 # Add the torch lib directory (and the nvidia/cuda_runtime subdir) to RPATH
 # so the loader can resolve libcudart.so.12 at runtime.
-if(FLASH_ATTENTION_ENABLE_CUDA AND EXISTS "${TORCH_PYTHON_LIB_DIR}")
+if(EXISTS "${TORCH_PYTHON_LIB_DIR}")
   get_filename_component(TORCH_CUDA_RUNTIME_DIR
     "${TORCH_PYTHON_LIB_DIR}/../../nvidia/cuda_runtime/lib"
     ABSOLUTE
@@ -157,6 +168,4 @@ if(FLASH_ATTENTION_ENABLE_CUDA AND EXISTS "${TORCH_PYTHON_LIB_DIR}")
   endif()
 endif()
 
-if(FLASH_ATTENTION_ENABLE_CUDA)
-  message(STATUS "CUDA is enabled with a kernel stub in src/csrc/attention_tiled_cuda.cu.")
-endif()
+message(STATUS "CUDA-only build enabled.")

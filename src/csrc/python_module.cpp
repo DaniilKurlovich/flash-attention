@@ -1,8 +1,10 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <torch/extension.h>
 
 #include "attention_tiled.h"
+#include "attention_tiled_cuda.h"
 
 namespace py = pybind11;
 

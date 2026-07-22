@@ -1,4 +1,6 @@
+#include <ATen/ops/empty.h>
 #include <cstdint>
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -17,7 +19,8 @@ constexpr int BLOCK_DIM = 128;
 
 template <int ROW_SIZE, int COL_SIZE, int BLOCK_SIZE>
 __device__ inline void global_to_shared_copy_by_tile_in_bf16(const nv_bfloat16* src, uint32_t dst,
-                                                             const int seq_len, const int global_tile_row, const int global_stride) {
+                                                             const int seq_len, const int global_tile_row, const int global_stride,
+                                                             const int smem_stride) {
   constexpr int num_elems_copy_in_nv_bfloat16 = 16 / sizeof(nv_bfloat16);
   const int total_chunks = ROW_SIZE * COL_SIZE / num_elems_copy_in_nv_bfloat16;
   const int tid = threadIdx.x;
@@ -32,20 +35,16 @@ __device__ inline void global_to_shared_copy_by_tile_in_bf16(const nv_bfloat16* 
           continue;
       }
       const nv_bfloat16 *src_addr = src + global_row * global_stride + col;
-      const uint32_t dst_addr = dst + (row * COL_SIZE + col) * sizeof(nv_bfloat16);
+      const uint32_t dst_addr = dst + (row * smem_stride + col) * sizeof(nv_bfloat16);
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
   }
-  asm volatile("cp.async.commit_group;");
-  asm volatile("cp.async.wait_all;");
-  __syncthreads();
 }
 
-__device__ inline void ldmatrix_x4(uint32_t dst[4], uint32_t src) {
+__device__ inline void ldmatrix_x4(uint32_t rmem[4], uint32_t smem_addr) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-        : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
-        : "r"(src)
-    );
+        : "=r"(rmem[0]), "=r"(rmem[1]), "=r"(rmem[2]), "=r"(rmem[3])
+        : "r"(smem_addr));
 }
 
 __device__ inline void ldmatrix_x2(uint32_t dst[2], uint32_t src) {
@@ -65,21 +64,27 @@ __device__ inline void ldmatrix_x2_transpose(uint32_t dst[2], uint32_t src) {
 }
 
 // computes matrix multiplication C = A @ B^T
-__device__ inline void mma_m16n8k16(uint32_t a[4], uint32_t b[2], float c[4]) {
+__device__ inline void mma_m16n8k16(uint32_t a_rmem[4], uint32_t b_rmem[2], float c_rmem[4]) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, "
-        "{%4, %5, %6, %7}, "
-        "{%8, %9}, "
-        "{%10, %11, %12, %13};"
-        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1]),
-          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3])
-    );
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c_rmem[0]), "+f"(c_rmem[1]),
+          "+f"(c_rmem[2]), "+f"(c_rmem[3])
+        : "r"(a_rmem[0]), "r"(a_rmem[1]), "r"(a_rmem[2]), "r"(a_rmem[3]),
+          "r"(b_rmem[0]), "r"(b_rmem[1]));
 }
 
+__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
+    __nv_bfloat162 v = __float22bfloat162_rn(make_float2(lo, hi));
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+
+
+constexpr int WARP_SIZE = 32;
+constexpr int WARP_COUNT = 4;
+
 template<int BLOCK_M, int BLOCK_N, int HEAD_DIM>
+__launch_bounds__(WARP_SIZE * WARP_COUNT)
 __global__ void attention_tiled_online_softmax_kernel_stub_v3(
   const __nv_bfloat16* __restrict__ query_ptr,
   const __nv_bfloat16* __restrict__ key_ptr,
@@ -109,19 +114,22 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
 
   bool causal
 ) {
-  // using namespace nvcuda;
+  using namespace nvcuda;
 
   constexpr int WMMA_M = 16;
   constexpr int WMMA_N = 8;
   constexpr int WMMA_K = 16;
 
-  static_assert(BLOCK_M % WMMA_M == 0, "BLOCK_M must be a multiple of 16");
+  static_assert(BLOCK_M % (WMMA_M * WARP_COUNT) == 0,
+                "BLOCK_M must be a multiple of 16 * WARP_COUNT (split-M)");
   static_assert(BLOCK_N % WMMA_N == 0, "BLOCK_N must be a multiple of 16");
   static_assert(HEAD_DIM % WMMA_K == 0, "HEAD_DIM must be a multiple of 16");
 
-  __shared__ __nv_bfloat16 q_smem[BLOCK_M][HEAD_DIM];
-  __shared__ __nv_bfloat16 k_smem[BLOCK_N][HEAD_DIM];
-  __shared__ __nv_bfloat16 v_smem[BLOCK_N][HEAD_DIM];
+  // Pad each row by 8 bf16 (16 bytes): keeps rows 16B-aligned for cp.async /
+  // ldmatrix while shifting consecutive rows by 4 banks to avoid conflicts.
+  constexpr int SMEM_LD = HEAD_DIM + 8;
+  __shared__ __align__(128) __nv_bfloat16 q_smem[BLOCK_M][SMEM_LD];
+  __shared__ __align__(128) __nv_bfloat16 kv_smem[BLOCK_N][SMEM_LD];
 
   int batch_id = blockIdx.z;
   int head_id = blockIdx.y;
@@ -145,40 +153,46 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
                head_id * o_stride_h +
                tile_id * BLOCK_M * o_stride_n;
 
-  uint32_t Q_rmem[BLOCK_M / WMMA_M][HEAD_DIM / WMMA_K][4] = {};
-  uint32_t K_rmem[BLOCK_N / WMMA_N][HEAD_DIM / WMMA_K][2] = {};
-  uint32_t V_rmem[BLOCK_N / WMMA_N][HEAD_DIM / WMMA_K][2] = {};
-  uint32_t P_rmem[BLOCK_M / WMMA_M][BLOCK_N / WMMA_N][4] = {};
+  constexpr int kTilesM = BLOCK_M / (WMMA_M * WARP_COUNT);
+  constexpr int kTilesN = BLOCK_N / WMMA_N;
+  constexpr int kTilesK = HEAD_DIM / WMMA_K;
+  constexpr int kTilesK2 = BLOCK_N / WMMA_K;
+  constexpr int kTilesD  = HEAD_DIM / WMMA_N;
 
-  float O_rmem[BLOCK_M / WMMA_M][HEAD_DIM / WMMA_K][4] = {};
+  uint32_t Q_rmem[kTilesM][kTilesK][4] = {};
+  uint32_t P_rmem[kTilesM][kTilesK2][4] = {};
+  float O_rmem[kTilesM][kTilesD][4] = {};
 
-  float max_prev[BLOCK_M / WMMA_M][2] = {};    // in .m16n8k16 accumulator per thread store 4 register, therefore for reduction on row need only 2
-  float row_sumexp[BLOCK_M / WMMA_M][2] = {};
+  float max_prev[kTilesM][2] = {};    // in .m16n8k16 accumulator per thread store 4 register, therefore for reduction on row need only 2
+  float row_sumexp[kTilesM][2] = {};
 
   // init
-  for (int mma_row_id = 0; mma_row_id < BLOCK_M / WMMA_M; ++mma_row_id) {
+  for (int mma_row_id = 0; mma_row_id < kTilesM; ++mma_row_id) {
       max_prev[mma_row_id][0] = -INFINITY;
       max_prev[mma_row_id][1] = -INFINITY;
   }
 
   uint32_t q_addr_smem = __cvta_generic_to_shared(q_smem);
-  uint32_t k_addr_smem = __cvta_generic_to_shared(k_smem);
-  uint32_t v_addr_smem = __cvta_generic_to_shared(v_smem);
+  uint32_t kv_addr_smem = __cvta_generic_to_shared(kv_smem);
   int global_start_row = tile_id * BLOCK_M;
-  global_to_shared_copy_by_tile_in_bf16<BLOCK_M, HEAD_DIM, BLOCK_DIM>(q_tile, q_addr_smem, q_seq_len, global_start_row, q_stride_n);
 
-  const int warp_id = threadIdx.x / 32;
+  global_to_shared_copy_by_tile_in_bf16<BLOCK_M, HEAD_DIM, BLOCK_DIM>(q_tile, q_addr_smem, q_seq_len, global_start_row, q_stride_n, SMEM_LD);
+  asm volatile("cp.async.commit_group;");
+  asm volatile("cp.async.wait_all;");
+  __syncthreads();
+
   const int lane_id = threadIdx.x % 32;
+  const int warp_id = threadIdx.x / 32;
 
-  for (int mma_row_id = 0; mma_row_id < BLOCK_M / WMMA_M; ++mma_row_id) {
-      for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-          // lanes 0-15: row offset 0..15, col offset 0
-          // lanes 16-31: row offset 0..15, col offset 8 (NOTE: this split its need for ldmatrix 8x8.x4 convention)
-          const int row = mma_row_id * WMMA_N + (lane_id % 16);
-          const int col = mma_col_id * WMMA_K + (lane_id / 16) * 8;
-          if (global_start_row + row >= q_seq_len) continue;
-          uint32_t q_addr_smem_src = q_addr_smem + (row * HEAD_DIM + col) * sizeof(__nv_bfloat16);
-          ldmatrix_x4(Q_rmem[mma_row_id][mma_col_id], q_addr_smem_src);
+  // Load this warp's Q tile into registers.
+  for (int mi = 0; mi < kTilesM; ++mi) {
+      for (int ki = 0; ki < kTilesK; ++ki) {
+          const int row_in_smem = (warp_id * kTilesM + mi) * WMMA_M;
+          const int col_in_smem = ki * WMMA_K;
+          const int r_Q = row_in_smem + lane_id % 16;
+          const int c_Q = col_in_smem + (lane_id / 16) * 8;
+          uint32_t q_smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&q_smem[r_Q][c_Q]));
+          ldmatrix_x4(Q_rmem[mi][ki], q_smem_addr);
       }
   }
 
@@ -186,49 +200,50 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
   for (int kv_tile_id = 0; kv_tile_id < iter_loops; ++kv_tile_id) {
     int kv_start_row = BLOCK_N * kv_tile_id;
 
-    // Load K tile into shared memory.
-    global_to_shared_copy_by_tile_in_bf16<BLOCK_N, HEAD_DIM, BLOCK_DIM>(k_tile, k_addr_smem, kv_seq_len, kv_start_row, k_stride_n);
-
-    // Load K tile into registers.
-    for (int mma_row_id = 0; mma_row_id < BLOCK_N / WMMA_N; ++mma_row_id) {
-        for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-            // lanes 0-7: row offset 0..8;
-            // lanes 8-15: row offset 0..8;
-            const int row = mma_row_id * WMMA_N + (lane_id % 8);
-            // lanes 0-7: col offset 0;
-            // lanes 8-16: col offset 8
-            const int col = mma_col_id * WMMA_K + (lane_id / 8) * 8;
-            uint32_t k_addr_smem_src = k_addr_smem + (row * HEAD_DIM + col) * sizeof(__nv_bfloat16);
-            ldmatrix_x2(K_rmem[mma_row_id][mma_col_id], k_addr_smem_src);
-        }
-    }
+    // Load K tile into shared memory (row-major over K).
+    __syncthreads();
+    global_to_shared_copy_by_tile_in_bf16<BLOCK_N, HEAD_DIM, BLOCK_DIM>(k_tile, kv_addr_smem, kv_seq_len, kv_start_row, k_stride_n, SMEM_LD);
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_all;");
+    __syncthreads();
 
     // ---- Tensor Core GEMM: S = Q @ K^T ----
     // A = Q      : BLOCK_M x HEAD_DIM, row-major
     // B = K^T    : HEAD_DIM x BLOCK_N, col-major (k_smem is physically row-major
     //              over K, which is exactly the col-major layout of K^T).
     // C = S      : BLOCK_M x BLOCK_N, row-major
-    float S_rmem[BLOCK_M / WMMA_M][BLOCK_N / WMMA_N][4] = {};
-    for (int mma_q_id = 0; mma_q_id < BLOCK_M / WMMA_M; ++mma_q_id) {
-        for (int mma_k_id = 0; mma_k_id < BLOCK_N / WMMA_N; ++mma_k_id) {
-            for (int mma_tile_id = 0; mma_tile_id < HEAD_DIM / WMMA_K; ++mma_tile_id) {
-                mma_m16n8k16(Q_rmem[mma_q_id][mma_tile_id], K_rmem[mma_k_id][mma_tile_id], S_rmem[mma_q_id][mma_k_id]);
+    // Every warp reads the full K tile; fragments are loaded per ni to keep
+    // register pressure low.
+    float S_rmem[kTilesM][kTilesN][4] = {};
+    for (int ni = 0; ni < kTilesN; ++ni) {
+        uint32_t K_rmem[kTilesK][2];
+        for (int ki = 0; ki < kTilesK; ++ki) {
+            const int row_in_smem = ni * WMMA_N;
+            const int col_in_smem = ki * WMMA_K;
+            const int r_K = row_in_smem + lane_id % 8;
+            const int c_K = col_in_smem + ((lane_id / 8) % 2) * 8;
+            uint32_t k_addr_smem_src = __cvta_generic_to_shared(&kv_smem[r_K][c_K]);
+            ldmatrix_x2(K_rmem[ki], k_addr_smem_src);
+        }
+        for (int mi = 0; mi < kTilesM; ++mi) {
+            for (int ki = 0; ki < kTilesK; ++ki) {
+                mma_m16n8k16(Q_rmem[mi][ki], K_rmem[ki], S_rmem[mi][ni]);
             }
         }
     }
 
     const float kScale = rsqrtf(HEAD_DIM);
     // apply scale and compute online softmax
-    for (int mma_row_id = 0; mma_row_id < BLOCK_M / WMMA_M; ++mma_row_id) {
-        for (int mma_col_id = 0; mma_col_id < BLOCK_N / WMMA_N; ++mma_col_id) {
+    for (int mi = 0; mi < kTilesM; ++mi) {
+        for (int ni = 0; ni < kTilesN; ++ni) {
             for (int d = 0; d < 4; ++d) {
-                S_rmem[mma_row_id][mma_col_id][d] *= kScale;
+                S_rmem[mi][ni][d] *= kScale;
             }
         }
 
         float cur_rowmax[2] = {-INFINITY, -INFINITY};
-        for (int mma_col_id = 0; mma_col_id < BLOCK_N / WMMA_N; ++mma_col_id) {
-            float* req = S_rmem[mma_row_id][mma_col_id];
+        for (int ni = 0; ni < kTilesN; ++ni) {
+            float* req = S_rmem[mi][ni];
             cur_rowmax[0] = max(cur_rowmax[0], max(req[0], req[1]));    // top 8 rows
             cur_rowmax[1] = max(cur_rowmax[1], max(req[2], req[3]));    // bottom 8  rows
         }
@@ -240,106 +255,98 @@ __global__ void attention_tiled_online_softmax_kernel_stub_v3(
         cur_rowmax[1] = max(__shfl_xor_sync(0xffffffff, cur_rowmax[1], 1), cur_rowmax[1]);
         cur_rowmax[1] = max(__shfl_xor_sync(0xffffffff, cur_rowmax[1], 2), cur_rowmax[1]);
 
-        // rescale
-        float scale[2] = {expf(max_prev[mma_row_id][0] - cur_rowmax[0]), expf(max_prev[mma_row_id][1] - cur_rowmax[1])};
-        // [BLOCK_M / WMMA_M][HEAD_DIM / WMMA_K]
-        for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-            O_rmem[mma_row_id][mma_col_id][0] *= scale[0];
-            O_rmem[mma_row_id][mma_col_id][1] *= scale[0];
-            O_rmem[mma_row_id][mma_col_id][2] *= scale[1];
-            O_rmem[mma_row_id][mma_col_id][3] *= scale[1];
+        // rescale prev value
+        float scale[2] = {__expf(max_prev[mi][0] - cur_rowmax[0]), __expf(max_prev[mi][1] - cur_rowmax[1])};
+        for (int di = 0; di < kTilesD; ++di) {
+            O_rmem[mi][di][0] *= scale[0];
+            O_rmem[mi][di][1] *= scale[0];
+            O_rmem[mi][di][2] *= scale[1];
+            O_rmem[mi][di][3] *= scale[1];
         }
 
         // simply write back with no condition
-        max_prev[mma_row_id][0] = cur_rowmax[0];
-        max_prev[mma_row_id][1] = cur_rowmax[1];
+        max_prev[mi][0] = cur_rowmax[0];
+        max_prev[mi][1] = cur_rowmax[1];
 
         // compute P and rowsumexp
-        float cur_rowsumexp[2] = {};
-        for (int mma_col_id = 0; mma_col_id < BLOCK_N / WMMA_N; ++mma_col_id) {
+        float cur_rowsumexp[2] = {0.0f, 0.0f};
+        for (int ni = 0; ni < kTilesN; ++ni) {
             // inplace modify matrix S
-            float* reqs = S_rmem[mma_row_id][mma_col_id];
-            reqs[0] = __expf(S_rmem[mma_row_id][mma_col_id][0] - max_prev[mma_row_id][0]);
-            reqs[1] = __expf(S_rmem[mma_row_id][mma_col_id][1] - max_prev[mma_row_id][0]);
-            reqs[2] = __expf(S_rmem[mma_row_id][mma_col_id][2] - max_prev[mma_row_id][1]);
-            reqs[3] = __expf(S_rmem[mma_row_id][mma_col_id][3] - max_prev[mma_row_id][1]);
+            float* reqs = S_rmem[mi][ni];
+            reqs[0] = __expf(reqs[0] - cur_rowmax[0]);
+            reqs[1] = __expf(reqs[1] - cur_rowmax[0]);
+            reqs[2] = __expf(reqs[2] - cur_rowmax[1]);
+            reqs[3] = __expf(reqs[3] - cur_rowmax[1]);
 
-            cur_rowsumexp[0] += reqs[0] + reqs[1];
-            cur_rowsumexp[1] += reqs[2] + reqs[3];
-
-            P_rmem[mma_row_id][mma_col_id][0] = __float2bfloat16(reqs[0]);
-            P_rmem[mma_row_id][mma_col_id][1] = __float2bfloat16(reqs[1]);
-            P_rmem[mma_row_id][mma_col_id][2] = __float2bfloat16(reqs[2]);
-            P_rmem[mma_row_id][mma_col_id][3] = __float2bfloat16(reqs[3]);
+            cur_rowsumexp[0] += reqs[0];
+            cur_rowsumexp[0] += reqs[1];
+            cur_rowsumexp[1] += reqs[2];
+            cur_rowsumexp[1] += reqs[3];
         }
-
-        // butterfly reduction
         cur_rowsumexp[0] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[0], 1);
         cur_rowsumexp[0] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[0], 2);
         cur_rowsumexp[1] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[1], 1);
         cur_rowsumexp[1] += __shfl_xor_sync(0xffffffff, cur_rowsumexp[1], 2);
 
-        row_sumexp[mma_row_id][0] = row_sumexp[mma_row_id][0] * scale[0] + cur_rowsumexp[0];
-        row_sumexp[mma_row_id][1] = row_sumexp[mma_row_id][1] * scale[1] + cur_rowsumexp[1];
+        row_sumexp[mi][0] = row_sumexp[mi][0] * scale[0] + cur_rowsumexp[0];
+        row_sumexp[mi][1] = row_sumexp[mi][1] * scale[1] + cur_rowsumexp[1];
+
+        for (int ki = 0; ki < kTilesK2; ++ki) {
+            const float* t0 = S_rmem[mi][2 * ki];
+            const float* t1 = S_rmem[mi][2 * ki + 1];
+            P_rmem[mi][ki][0] = pack_bf16x2(t0[0], t0[1]);
+            P_rmem[mi][ki][1] = pack_bf16x2(t0[2], t0[3]);
+            P_rmem[mi][ki][2] = pack_bf16x2(t1[0], t1[1]);
+            P_rmem[mi][ki][3] = pack_bf16x2(t1[2], t1[3]);
+        }
     }
 
     // Load V tile into shared memory.
-    global_to_shared_copy_by_tile_in_bf16<BLOCK_N, HEAD_DIM, BLOCK_DIM>(v_tile, v_addr_smem, kv_seq_len, kv_start_row, v_stride_n);
-    // load V on registers
-    for (int mma_row_id = 0; mma_row_id < BLOCK_N / WMMA_N; ++mma_row_id) {
-        for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-            // m16n8k16 expects B in col-major; V is row-major in smem, so we
-            // use ldmatrix_x2_transpose. The source addressing is the same as
-            // a non-transposed m8n8 x2 load: each warp half reads one 8-column
-            // block of an 8-row stripe.
-            const int row = mma_row_id * WMMA_N + (lane_id % 8);
-            const int col = mma_col_id * WMMA_K + (lane_id / 8) * 8;
-
-            uint32_t v_addr_smem_src = v_addr_smem + (row * HEAD_DIM + col) * sizeof(__nv_bfloat16);
-            ldmatrix_x2_transpose(V_rmem[mma_row_id][mma_col_id], v_addr_smem_src);
-        }
-    }
+    __syncthreads();
+    global_to_shared_copy_by_tile_in_bf16<BLOCK_N, HEAD_DIM, BLOCK_DIM>(v_tile, kv_addr_smem, kv_seq_len, kv_start_row, v_stride_n, SMEM_LD);
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_all;");
+    __syncthreads();
 
     // ---- Tensor Core GEMM: O += P @ V ----
     // A = P : BLOCK_M x BLOCK_N, row-major
     // B = V : BLOCK_N x HEAD_DIM, row-major (loaded transposed for col-major B)
     // C = O : BLOCK_M x HEAD_DIM, row-major
-    for (int mma_row_id = 0; mma_row_id < BLOCK_M / WMMA_M; ++mma_row_id) {
-        for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-            for (int k_id = 0; k_id < BLOCK_N / WMMA_N; ++k_id) {
-                mma_m16n8k16(P_rmem[mma_row_id][k_id],
-                             V_rmem[k_id][mma_col_id],
-                             O_rmem[mma_row_id][mma_col_id]);
+    // Every warp reads the full V tile; fragments are loaded per ki to keep
+    // register pressure low.
+    for (int ki = 0; ki < kTilesK2; ++ki) {
+        uint32_t V_rmem[kTilesD][2];
+        for (int di = 0; di < kTilesD; ++di) {
+            const int row = ki * WMMA_K + (lane_id % 16);
+            const int col = di * WMMA_N;
+            uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&kv_smem[row][col]));
+            ldmatrix_x2_transpose(V_rmem[di], addr);
+        }
+        for (int mi = 0; mi < kTilesM; ++mi) {
+            for (int di = 0; di < kTilesD; ++di) {
+                mma_m16n8k16(P_rmem[mi][ki],
+                             V_rmem[di],
+                             O_rmem[mi][di]);
             }
         }
     }
   }
 
   // Finalize and write back O.
-  for (int mma_row_id = 0; mma_row_id < BLOCK_M / WMMA_M; ++mma_row_id) {
-      for (int mma_col_id = 0; mma_col_id < HEAD_DIM / WMMA_K; ++mma_col_id) {
-          float* reqs = O_rmem[mma_row_id][mma_col_id];
-          reqs[0] /= row_sumexp[mma_row_id][0];
-          reqs[1] /= row_sumexp[mma_row_id][0];
-          reqs[2] /= row_sumexp[mma_row_id][1];
-          reqs[3] /= row_sumexp[mma_row_id][1];
+  for (int mi = 0; mi < kTilesM; ++mi) {
+      for (int di = 0; di < kTilesD; ++di) {
+          float* reqs = O_rmem[mi][di];
+          reqs[0] /= row_sumexp[mi][0];
+          reqs[1] /= row_sumexp[mi][0];
+          reqs[2] /= row_sumexp[mi][1];
+          reqs[3] /= row_sumexp[mi][1];
 
-          // write back
-          const int group_id = lane_id >> 2;
-          const int thread_in_group = lane_id & 3;
-
-          const int local_row0 = mma_row_id * WMMA_M + group_id;
-          const int local_row1 = local_row0 + 8;
-          const int col = mma_col_id * WMMA_N + thread_in_group * 2;
-
-          if (global_start_row + local_row0 < q_seq_len) {
-              o_tile[local_row0 * o_stride_n + col + 0] = __float2bfloat16(reqs[0]);
-              o_tile[local_row0 * o_stride_n + col + 1] = __float2bfloat16(reqs[1]);
-          }
-          if (global_start_row + local_row1 < q_seq_len) {
-              o_tile[local_row1 * o_stride_n + col + 0] = __float2bfloat16(reqs[2]);
-              o_tile[local_row1 * o_stride_n + col + 1] = __float2bfloat16(reqs[3]);
-          }
+          int row = (warp_id * kTilesM + mi) * WMMA_M + lane_id / 4;
+          int col = di * WMMA_N + (lane_id % 4) * 2;
+          reinterpret_cast<nv_bfloat162*>(o_tile + row * o_stride_n + col)[0] =
+              __float22bfloat162_rn({O_rmem[mi][di][0], O_rmem[mi][di][1]});
+          reinterpret_cast<nv_bfloat162*>(o_tile + (row + 8) * o_stride_n + col)[0] =
+              __float22bfloat162_rn({O_rmem[mi][di][2], O_rmem[mi][di][3]});
       }
   }
 }
@@ -362,6 +369,10 @@ void launch_attention_v3(
   auto value_ptr = reinterpret_cast<const __nv_bfloat16*>(value.data_ptr());
   auto output_ptr = reinterpret_cast<__nv_bfloat16*>(output_tensor.data_ptr());
 
+  cudaFuncSetAttribute(
+           attention_tiled_online_softmax_kernel_stub_v3<BLOCK_M, BLOCK_N, HEAD_DIM>,
+           cudaFuncAttributePreferredSharedMemoryCarveout,
+           100);
   attention_tiled_online_softmax_kernel_stub_v3<BLOCK_M, BLOCK_N, HEAD_DIM><<<grid, block>>>(
       query_ptr,
       key_ptr,
@@ -396,6 +407,7 @@ torch::Tensor attention_tiled_online_softmax_cuda(
     bool causal,
     c10::optional<double> scale,
     int64_t tile_size) {
+  (void)scale;
   (void)tile_size;
 
   TORCH_CHECK(query.is_cuda(), "query must be a CUDA tensor");
@@ -422,7 +434,7 @@ torch::Tensor attention_tiled_online_softmax_cuda(
   //     ? static_cast<float>(*scale)
   //     : 1.0f / std::sqrt(static_cast<float>(query.size(3)));
 
-  auto output_tensor = torch::zeros(
+  auto output_tensor = torch::empty(
     {batch_size, num_heads, q_seq_len, value_dim},
     query.options()
   );

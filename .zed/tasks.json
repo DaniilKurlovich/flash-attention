@@ -34,5 +34,11 @@
         "command": "source .venv/bin/activate && PYTHONPATH=build-cuda/python:$PYTHONPATH python bench/bench_attention.py --batch 2 --heads 8 --q-len 1024 --dim 64 --repeats 10",
         "use_new_terminal": true,
         "reveal": "always"
+    },
+    {
+        "label": "Profile CUDA kernel",
+        "command": "./bench/profile_cuda.sh",
+        "use_new_terminal": true,
+        "reveal": "always"
     }
 ]

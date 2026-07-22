@@ -28,7 +28,6 @@ nvidia-nvtx==13.0.85
 packaging==26.1
 pluggy==1.6.0
 pygments==2.20.0
-pytest==9.0.3
 setuptools==81.0.0
 sympy==1.14.0
 torch==2.11.0
