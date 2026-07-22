@@ -1,4 +1,5 @@
 #include <cmath>
+#include <iostream>
 
 #include <torch/cuda.h>
 #include <torch/torch.h>
@@ -38,6 +39,11 @@ torch::Tensor attention_reference_cuda(
 }
 
 torch::Tensor make_cuda_tensor(int batch_size = 8, int num_heads = 8, int seq_len = 128, int head_dim = 64) {
+  static bool seeded = false;
+  if (!seeded) {
+    torch::manual_seed(42);
+    seeded = true;
+  }
   return torch::randn({batch_size, num_heads, seq_len, head_dim},
                       torch::TensorOptions().device(torch::kCUDA).dtype(torch::kBFloat16));
 }
@@ -62,6 +68,17 @@ FLASH_ATTENTION_TEST(cuda_matches_reference_non_causal) {
       8);
   const auto expected =
       attention_reference_cuda(query, key, value, false, c10::nullopt);
+
+  // Debug: print max error location and surrounding values
+  {
+    const auto diff = (actual.cpu().to(torch::kFloat32) - expected.cpu().to(torch::kFloat32)).abs();
+    const auto flat_idx = diff.argmax().item<int64_t>();
+    std::cerr << "max error idx " << flat_idx << " actual="
+              << actual.cpu().to(torch::kFloat32).reshape(-1)[flat_idx].item<float>()
+              << " expected="
+              << expected.cpu().to(torch::kFloat32).reshape(-1)[flat_idx].item<float>()
+              << std::endl;
+  }
 
   FLASH_ATTENTION_ASSERT(actual.is_cuda());
   FLASH_ATTENTION_ASSERT(actual.scalar_type() == torch::kBFloat16);

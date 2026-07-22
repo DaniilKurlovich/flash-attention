@@ -1,0 +1,44 @@
+[
+    {
+        "label": "Build CUDA extension",
+        "command": "source .venv/bin/activate && cmake --build build-cuda",
+        "use_new_terminal": true,
+        "reveal": "always"
+    },
+    {
+        "label": "Build CUDA extension (Debug)",
+        "command": "source .venv/bin/activate && cmake -S . -B build-cuda-debug -DCMAKE_BUILD_TYPE=Debug -DFLASH_ATTENTION_ENABLE_CUDA=ON -DCMAKE_CUDA_FLAGS='-G -g' -DCMAKE_CXX_FLAGS='-g' && cmake --build build-cuda-debug --target flash_attention_csrc_tests -j$(nproc)",
+        "use_new_terminal": true,
+        "reveal": "always"
+    },
+    {
+        "label": "Run pytest",
+        "command": "source .venv/bin/activate && PYTHONPATH=build-cuda/python python -m pytest tests -v",
+        "use_new_terminal": true,
+        "reveal": "always"
+    },
+    {
+        "label": "Run native tests",
+        "command": "./build-cuda/flash_attention_csrc_tests",
+        "use_new_terminal": true,
+        "reveal": "always"
+    },
+    {
+        "label": "Run native tests (Debug)",
+        "command": "./build-cuda-debug/flash_attention_csrc_tests",
+        "use_new_terminal": true,
+        "reveal": "always"
+    },
+    {
+        "label": "Run benchmark",
+        "command": "source .venv/bin/activate && PYTHONPATH=build-cuda/python:$PYTHONPATH python bench/bench_attention.py --batch 2 --heads 8 --q-len 1024 --dim 64 --repeats 10",
+        "use_new_terminal": true,
+        "reveal": "always"
+    },
+    {
+        "label": "Profile CUDA kernel",
+        "command": "./bench/profile_cuda.sh",
+        "use_new_terminal": true,
+        "reveal": "always"
+    }
+]

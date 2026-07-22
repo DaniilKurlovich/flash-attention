@@ -182,24 +182,6 @@ def benchmark(
         )
     )
 
-    # 3. C++ / CUDA extension
-    try:
-        results.append(
-            _bench_one(
-                attention_tiled_online_softmax_cpp,
-                query,
-                key,
-                value,
-                causal=causal,
-                tile_size=tile_size,
-                name="cpp_extension",
-                warmup=warmup,
-                repeats=repeats,
-            )
-        )
-    except RuntimeError as exc:
-        warnings.warn(f"C++ extension not available: {exc}")
-
     # 4. torch.nn.functional.scaled_dot_product_attention (if available)
     try:
 
@@ -222,6 +204,24 @@ def benchmark(
         )
     except Exception as exc:
         warnings.warn(f"torch sdpa skipped: {exc}")
+
+    # 3. C++ / CUDA extension
+    try:
+        results.append(
+            _bench_one(
+                attention_tiled_online_softmax_cpp,
+                query,
+                key,
+                value,
+                causal=causal,
+                tile_size=tile_size,
+                name="cpp_extension",
+                warmup=warmup,
+                repeats=repeats,
+            )
+        )
+    except RuntimeError as exc:
+        warnings.warn(f"C++ extension not available: {exc}")
 
     print(f"{'Implementation':<20} {'Median':>12} {'Throughput':>12} {'Output shape'}")
     print("-" * 70)

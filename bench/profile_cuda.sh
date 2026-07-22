@@ -15,36 +15,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Use venv python if available, otherwise python3
-if [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
-    PYTHON_EXE="${REPO_ROOT}/.venv/bin/python"
-elif command -v python3 &>/dev/null; then
-    PYTHON_EXE="python3"
-else
-    PYTHON_EXE="python"
-fi
-
+PYTHON_EXE="${REPO_ROOT}/.venv/bin/python"
 PYTHON_VER="$(${PYTHON_EXE} -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
 
 # Prefer build/ if it contains a working CUDA .so for the venv python,
 # otherwise fall back to build-cuda/.
-if [ -f "${REPO_ROOT}/build/python/flash_attention_cpp.cpython-${PYTHON_VER}-x86_64-linux-gnu.so" ]; then
-    BUILD_DIR="${REPO_ROOT}/build"
-else
-    BUILD_DIR="${REPO_ROOT}/build-cuda"
-fi
+BUILD_DIR="${REPO_ROOT}/build-cuda"
 
-NCU_BIN=""
-if command -v ncu &>/dev/null; then
-    NCU_BIN="ncu"
-elif [ -x "/usr/local/cuda/bin/ncu" ]; then
-    NCU_BIN="/usr/local/cuda/bin/ncu"
-elif [ -x "/usr/local/cuda-12/bin/ncu" ]; then
-    NCU_BIN="/usr/local/cuda-12/bin/ncu"
-else
-    echo "ERROR: ncu not found. Add /usr/local/cuda/bin to your PATH."
-    exit 1
-fi
+NCU_BIN="/usr/local/cuda-12/bin/ncu"
 
 PYTHONPATH="${BUILD_DIR}/python:${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONPATH
